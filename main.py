@@ -60,7 +60,7 @@ def score_sample_under_true_posterior(x, y, value, coef_x, coef_y, horizontal_di
     theta = torch.atan2(torch.tensor(coef_x), torch.tensor(coef_y))
 
     # rotate x, y onto the horizontal
-    xy = torch.tensor([x, y])
+    xy = torch.stack([x, y])
     p = rotate(xy, theta)
 
     # score x coordinate of p
@@ -84,7 +84,7 @@ def sample_xy_conditioned_on(joint_dist, value, coef_x, coef_y, num_samples):
     assert (yval[0] < 1e-5).all()
 
     # sample point
-    h = horizontal_dist.rsample([num_samples]).squeeze()  # x coordinate
+    h = horizontal_dist.rsample([num_samples]).reshape(-1)  # x coordinate
     p = torch.stack([h, yval[1].repeat(num_samples)])
 
     # rotate that point back onto the line x+y=value
@@ -95,17 +95,19 @@ def sample_xy_conditioned_on(joint_dist, value, coef_x, coef_y, num_samples):
     return x, y, horizontal_dist.log_prob(h)
 
 
-class InferenceCompilation:
+# def _project_to_simplex(self, xys):
+#     # https://home.ttic.edu/~wwang5/papers/SimplexProj.pdf
+#     N, D = xys.shape
+#     sorted_xys, _ = torch.sort(xys)
+#     tmp = torch.matmul((sorted_xys.cumsum(dim=1)-1), torch.diag(1./torch.arange(1, D+1)))
+
+#     v = xys - torch.index_select(tmp, 0, torch.sum(sorted_xys > tmp, dim=1))
+#     return torch.relu(v)
+
+
+class AmortizedInference:
     def __init__(self, cfg):
         self.cfg = cfg
-
-        self.latent_transform = torch.nn.Sequential(
-            torch.nn.Linear(1, cfg.hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(cfg.hidden_size, cfg.hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(cfg.hidden_size, 2),
-        )
 
         # generate true posterior p(x,y|z) and data distribution p(z)
         xdist = dist.Normal(cfg.mu_x, cfg.std_x)
@@ -134,27 +136,20 @@ class InferenceCompilation:
     def _clip_gradients(self):
         nn.utils.clip_grad_norm_(self.latent_transform.parameters(), 1)
 
-    def _project_to_simplex(self, xys):
-        # https://home.ttic.edu/~wwang5/papers/SimplexProj.pdf
-        N, D = xys.shape
-        sorted_xys, _ = torch.sort(xys)
-        tmp = torch.matmul((sorted_xys.cumsum(dim=1)-1), torch.diag(1./torch.arange(1, D+1)))
+    def _sample_ddist(self, z, num_samples):
+        raise NotImplementedError
 
-        v = xys - torch.index_select(tmp, 0, torch.sum(sorted_xys > tmp, dim=1))
-        return torch.relu(v)
+    def _score_ddist(self, z, x, y):
+        raise NotImplementedError
 
     def infer(self):
         for _ in range(cfg.num_data_samples):
             z = self.data_dist.rsample([1])
-            params = self.latent_transform(z)
-            # ddist = dist.Dirichlet(params)
-            ddist = dist.Normal(params[0], torch.exp(params[1]))
 
-            x, y, true_scores = self.true_posterior(z, cfg.num_posterior_samples)
+            x, y, sample_scores = self._sample_ddist(z, cfg.num_posterior_samples)
 
-            # xy_probs = self._project_to_simplex(torch.stack(xys))
-            proposal_scores = ddist.log_prob(x)
-            kl = (true_scores - proposal_scores).sum()
+            scores = self._score_ddist(z, x, y)
+            kl = (sample_scores - scores).sum()
 
             self.optimizer.zero_grad()
             kl.backward()
@@ -163,17 +158,150 @@ class InferenceCompilation:
         return self
 
     def proposal(self):
+        raise NotImplementedError
+
+
+class InferenceCompilation(AmortizedInference):
+    def _sample_ddist(self, z, num_samples):
+        return self.true_posterior(z, num_samples)
+
+
+class VariationalInference(AmortizedInference):
+    def _score_ddist(self, z, x, y):
+        return score_sample_under_true_posterior(x, y, z, self.cfg.coef_x, self.cfg.coef_y, self.horizontal_dist(z))
+
+
+class CheatingIC(InferenceCompilation):
+    def __init__(self, cfg):
+        self.latent_transform = torch.nn.Sequential(
+            torch.nn.Linear(1, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, 2),
+        )
+
+        super().__init__(cfg)
+
+    def _get_proposal_dist(self, z):
+        params = self.latent_transform(z)
+        return dist.Normal(params[0], torch.exp(params[1]))
+
+    def _score_ddist(self, z, x, y):
+        ddist = self._get_proposal_dist(z)
+        return ddist.log_prob(x)
+
+    def proposal(self):
         def _proposal(z):
             params = self.latent_transform(z)
             ddist = dist.Normal(params[0], torch.exp(params[1]))
-            return Proposal(ddist, z, self.cfg.coef_x, self.cfg.coef_y)
+            return CheatingProposal(ddist, z, self.cfg.coef_x, self.cfg.coef_y)
+        return _proposal
+
+
+class NormalWithTransformVI(VariationalInference):
+    def __init__(self, cfg):
+        self.latent_transform = torch.nn.Sequential(
+            torch.nn.Linear(1, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, 2),
+        )
+        self.transform = torch.nn.Linear(1, 1)
+
+        super().__init__(cfg)
+
+    def _initialize_optimizer(self):
+        params = list(self.latent_transform.parameters()) + list(self.transform.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=self.cfg.lr)
+
+    def _clip_gradients(self):
+        nn.utils.clip_grad_norm_(self.latent_transform.parameters(), 1)
+        nn.utils.clip_grad_norm_(self.transform.parameters(), 1)
+
+    def _get_proposal_dist(self, z):
+        params = self.latent_transform(z)
+
+        mean = params[0]
+        stddev = torch.exp(params[1])
+
+        return dist.Normal(mean, stddev)
+
+    def _sample_ddist(self, z, num_samples):
+        ddist = self._get_proposal_dist(z)
+        x = ddist.sample([num_samples]).reshape(num_samples, 1)
+        score = ddist.log_prob(x)
+        y = self.transform(x)
+
+        return x.reshape(-1), y.reshape(-1), score
+
+    def proposal(self):
+        def _proposal(z):
+            ddist = self._get_proposal_dist(z)
+            return Proposal(ddist, z)
+        return _proposal
+
+
+class NormalIC(InferenceCompilation):
+    def __init__(self, cfg):
+        self.latent_transform = torch.nn.Sequential(
+            torch.nn.Linear(1, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, cfg.hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(cfg.hidden_size, 5),
+        )
+
+        super().__init__(cfg)
+
+    def _get_proposal_dist(self, z):
+        params = self.latent_transform(z)
+
+        means = params[:2]
+        variances = torch.exp(params[2:4])
+        correlation = torch.tanh(params[4])
+
+        cov = torch.sqrt(variances).prod() * correlation
+        covariance = torch.tensor([[variances[0], cov], [cov, variances[1]]])
+
+        return dist.MultivariateNormal(means, covariance)
+
+    def _score_ddist(self, z, x, y):
+        ddist = self._get_proposal_dist(z)
+        return ddist.log_prob(torch.stack([x, y], dim=1))
+
+    def proposal(self):
+        def _proposal(z):
+            ddist = self._get_proposal_dist(z)
+            return NormalProposal(ddist, z)
         return _proposal
 
 
 class Proposal:
-    def __init__(self, ddist, z, coef_x, coef_y):
+    def __init__(self, ddist, z):
         self.ddist = ddist
         self.z = z
+
+    def sample(self, n=1):
+        raise NotImplementedError
+
+
+class NormalWithTransformProposal(Proposal):
+    def __init__(self, ddist, transform, z):
+        super().__init__(ddist, z)
+        self.transform = transform
+
+    def sample(self, n=1):
+        xs = self.ddist.rsample([n])
+        ys = self.transform(xs)
+        score = self.ddist.log_prob(xs)
+        return (xs, ys), score
+
+
+class CheatingProposal(Proposal):
+    def __init__(self, ddist, z, coef_x, coef_y):
+        super().__init__(ddist, z)
         self.coef_x = coef_x
         self.coef_y = coef_y
 
@@ -181,6 +309,14 @@ class Proposal:
         x = self.ddist.rsample([n])
         y = (self.z - self.coef_x * x) / self.coef_y
         score = self.ddist.log_prob(x)
+        return (x, y), score
+
+
+class NormalProposal(Proposal):
+    def sample(self, n=1):
+        sample = self.ddist.rsample([n])
+        score = self.ddist.log_prob(sample)
+        x, y = sample.squeeze()
         return (x, y), score
 
 
@@ -193,8 +329,8 @@ def get_args():
     parser.add_argument('--mu_y', type=float, default=0., help='mean of y')
     parser.add_argument('--std_y', type=float, default=1., help='standard devation of y')
     parser.add_argument('--p', type=float, default=0., help='correlation between x and y')
-    parser.add_argument('--coef_x', type=float, default=3., help='coefficient on x')
-    parser.add_argument('--coef_y', type=float, default=2., help='coefficient on y')
+    parser.add_argument('--coef_x', type=float, default=1., help='coefficient on x')
+    parser.add_argument('--coef_y', type=float, default=1., help='coefficient on y')
     parser.add_argument('--b', type=float, default=7., help='what coef_x * x + coef_y * y is equal to')
 
     # Inference Compilation Parameters
@@ -209,23 +345,34 @@ def get_args():
     # return it all
     return args, parser
 
+# TODO: REMOVE
+def construct_horizontal_dist(cfg, joint):
+    # angle that x+y=value makes with the horizontal
+    theta = torch.atan2(torch.tensor(cfg.coef_x), torch.tensor(cfg.coef_y))
+
+    # rotate joint_dist so that the line coef_x*x + coef_y*y = value is parallel to the horizontal axis
+    rot_dist = rotate_dist(joint, theta)
+
+    # condition the rotated distribution on y=value
+    return lambda value: condition_dist(rot_dist, value)
+
 def trial_sample(cfg):
     true_posterior = construct_true_posterior(cfg)
     x, y, score = true_posterior(torch.tensor(cfg.b), 1)
     print("{} * x + {} * y = {} * {} + {} * {} = {}".format(cfg.coef_x, cfg.coef_y, cfg.coef_x, x, cfg.coef_y, y, cfg.coef_x*x + cfg.coef_y*y))
     print("score of sample is log p(x={}, y={} | z={}) = {}".format(x, y, cfg.b, score))
 
+def run_inference_compilation(cfg):
+    # ai = CheatingIC(cfg)
+    # ai = NormalIC(cfg)
+    ai = NormalWithTransformVI(cfg)
 
-if __name__ == "__main__":
-    cfg, _ = get_args()
-
-    ic = InferenceCompilation(cfg)
-    horizontal_dist = ic.horizontal_dist
-    ic.infer()
+    horizontal_dist = ai.horizontal_dist
+    ai.infer()
     with torch.no_grad():
         for _ in range(10):
-            proposal = ic.proposal()
-            z = ic.data_dist.sample([1])
+            proposal = ai.proposal()
+            z = ai.data_dist.sample([1])
             print('sampled z: ', z)
             ddist = proposal(z)
             (x, y), score = ddist.sample()
@@ -233,5 +380,15 @@ if __name__ == "__main__":
             print("{} * x + {} * y = {} * {} + {} * {} = {}".format(cfg.coef_x, cfg.coef_y, cfg.coef_x, x, cfg.coef_y, y, estimated_z))
             print("score of sample under proposal is log p(x={}, y={} | z={}) = {}".format(x, y, estimated_z, score))
 
-            true_score = score_sample_under_true_posterior(x, y, z, cfg.coef_x, cfg.coef_y, horizontal_dist(z))
-            print("score of sample under true posterior is {}".format(true_score))
+            try:
+                true_score = score_sample_under_true_posterior(x, y, z, cfg.coef_x, cfg.coef_y, horizontal_dist(z))
+                print("score of sample under true posterior is {}".format(true_score))
+            except:
+                pass
+            print('')
+
+
+if __name__ == "__main__":
+    cfg, _ = get_args()
+
+    run_inference_compilation(cfg)
