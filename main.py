@@ -364,8 +364,8 @@ def trial_sample(cfg):
 
 def run_inference_compilation(cfg):
     # ai = CheatingIC(cfg)
-    # ai = NormalIC(cfg)
-    ai = NormalWithTransformVI(cfg)
+    ai = NormalIC(cfg)
+    # ai = NormalWithTransformVI(cfg)
 
     horizontal_dist = ai.horizontal_dist
     ai.infer()
